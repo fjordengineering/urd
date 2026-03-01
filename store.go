@@ -67,8 +67,24 @@ func (s *Store) validate() error {
 	for _, st := range s.Streams {
 		streamTotal += time.Duration(st.Seconds) * time.Second
 	}
-	wallClock := s.TotalWallClock()
-	if wallClock > 0 && streamTotal < wallClock {
+	// Only count closed sessions. Open sessions represent live time that
+	// hasn't been flushed to stream seconds yet (e.g. after a crash).
+	var wallClock time.Duration
+	for _, sess := range s.Sessions {
+		if sess.End != nil {
+			wallClock += sess.End.Sub(sess.Start)
+		}
+	}
+	wallClock = wallClock.Truncate(time.Second)
+	// Allow 1s tolerance per closed session for flushStream truncation.
+	closedCount := 0
+	for _, sess := range s.Sessions {
+		if sess.End != nil {
+			closedCount++
+		}
+	}
+	tolerance := time.Duration(closedCount) * time.Second
+	if wallClock > 0 && streamTotal+tolerance < wallClock {
 		return fmt.Errorf(
 			"inconsistent data in %s: total stream time (%s) is less than wall-clock time (%s)",
 			s.FilePath, streamTotal, wallClock,
@@ -209,11 +225,15 @@ func (s *Store) flushStream(st *Stream) {
 }
 
 func (s *Store) SaveForBackground() error {
-	now := time.Now()
 	for i := range s.Streams {
-		if s.Streams[i].Active {
-			s.flushStream(&s.Streams[i])
-			s.Streams[i].StartedAt = &now
+		if s.Streams[i].Active && s.Streams[i].StartedAt != nil {
+			elapsed := time.Since(*s.Streams[i].StartedAt)
+			whole := elapsed.Truncate(time.Second)
+			s.Streams[i].Seconds += int64(whole / time.Second)
+			// Advance StartedAt by only the whole seconds so the
+			// sub-second remainder isn't lost on each background save.
+			adjusted := s.Streams[i].StartedAt.Add(whole)
+			s.Streams[i].StartedAt = &adjusted
 		}
 	}
 	return s.Save()
