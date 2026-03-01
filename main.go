@@ -18,6 +18,10 @@ var (
 	helpStyle   = lipgloss.NewStyle().Faint(true).MarginTop(1)
 )
 
+// tickMsg drives the 1-second UI refresh loop. We use tea.Tick (which
+// internally uses time.NewTimer) rather than a goroutine with time.Ticker
+// because Bubble Tea's message-based architecture requires all state updates
+// to flow through Update(). A raw goroutine would cause data races.
 type tickMsg time.Time
 
 func tickCmd() tea.Cmd {
@@ -26,17 +30,21 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+// model holds all TUI state. Store is a pointer (shared, mutable state)
+// while everything else is value-type view state. pendingD implements
+// vim-style "dd" delete: the first "d" sets pendingD, the second triggers
+// the delete. Any other key resets it.
 type model struct {
-	store     *Store
-	cursor    int
-	adding      bool
-	addAbove    bool
-	pendingD    bool
-	confirmDel  bool
-	textinput textinput.Model
-	ticking   bool
-	width     int
-	height    int
+	store      *Store
+	cursor     int
+	adding     bool
+	addAbove   bool
+	pendingD   bool
+	confirmDel bool
+	textinput  textinput.Model
+	ticking    bool
+	width      int
+	height     int
 }
 
 func initialModel(store *Store) model {
@@ -94,6 +102,10 @@ func (m *model) cursorID() string {
 	return m.store.Streams[m.cursor].ID
 }
 
+// sortAndFollow re-sorts the stream list and moves the cursor to follow the
+// stream it was previously on. Without this, sorting would silently move the
+// cursor to a different stream, which is disorienting — the user expects the
+// highlight to stay on the same item even as the list reorders.
 func (m *model) sortAndFollow() {
 	id := m.cursorID()
 	m.store.SortStreams()
@@ -144,9 +156,11 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "q", "ctrl+c":
+		// Save with streams still active so they resume on next launch.
+		// We use SaveForBackground (not StopAll + Save) to preserve the
+		// active state — quitting is not the same as stopping work.
 		m.store.SaveForBackground()
 		return m, tea.Quit
-
 
 	case "j", "down", "ctrl+j":
 		if len(m.store.Streams) > 0 {
@@ -245,6 +259,10 @@ func (m model) updateConfirmDel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// performDelete removes the stream at the cursor. If the stream was active,
+// we deactivate it first (without flushing — the time is being discarded with
+// the stream) and check whether that was the last active stream so we can
+// close the wall-clock session.
 func (m model) performDelete() (tea.Model, tea.Cmd) {
 	if len(m.store.Streams) == 0 {
 		return m, nil
@@ -261,6 +279,7 @@ func (m model) performDelete() (tea.Model, tea.Cmd) {
 	}
 	m.store.SortStreams()
 	m.store.Save()
+	// Clamp cursor so it doesn't point past the end of the list.
 	if m.cursor >= len(m.store.Streams) && m.cursor > 0 {
 		m.cursor--
 	}
@@ -348,6 +367,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	// WithAltScreen so the TUI doesn't pollute the user's scroll-back buffer
+	// — on exit, the terminal is restored to its previous state.
 	p := tea.NewProgram(initialModel(store), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
