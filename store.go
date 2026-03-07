@@ -10,18 +10,13 @@ import (
 	"time"
 )
 
-// Stream represents a named time-tracking category. Time is tracked using a
-// two-part scheme: Seconds stores the cumulative flushed time as whole seconds,
-// while StartedAt marks when the current active period began. This split lets
-// us persist progress to disk (via Seconds) without stopping the timer, while
-// StartedAt provides the live component that Elapsed() adds on top.
-// Seconds is int64 rather than float64 because sub-second precision isn't
-// meaningful for a human time tracker and whole seconds avoid floating-point
-// drift across repeated flush cycles.
+// Stream represents a named time-tracking category. Streams are toggleable
+// labels — actual time is tracked via Sessions (wall-clock periods). A stream
+// only records whether it's currently active and when the current activation
+// started, which is used to manage session boundaries.
 type Stream struct {
 	ID        string     `json:"id"`
 	Name      string     `json:"name"`
-	Seconds   int64      `json:"seconds"`
 	Active    bool       `json:"active"`
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
@@ -75,9 +70,6 @@ func LoadStore(path string) (*Store, error) {
 	if err := json.Unmarshal(data, s); err != nil {
 		return nil, err
 	}
-	if err := s.validate(); err != nil {
-		return nil, err
-	}
 	// Safety fallback: a stream can end up Active with no StartedAt if the
 	// JSON was hand-edited or if a bug wrote a partial state. Rather than
 	// refusing to load, we recover by setting StartedAt to now — the stream
@@ -89,39 +81,6 @@ func LoadStore(path string) (*Store, error) {
 		}
 	}
 	return s, nil
-}
-
-func (s *Store) validate() error {
-	var streamTotal time.Duration
-	for _, st := range s.Streams {
-		streamTotal += time.Duration(st.Seconds) * time.Second
-	}
-	// Only count closed sessions for validation. Open sessions represent
-	// live time that hasn't been flushed to stream seconds yet (e.g. after
-	// a crash or force-quit).
-	var wallClock time.Duration
-	for _, sess := range s.Sessions {
-		if sess.End != nil {
-			wallClock += sess.End.Sub(sess.Start)
-		}
-	}
-	wallClock = wallClock.Truncate(time.Second)
-	// Allow a tolerance of 1 second per closed session to account for
-	// truncation in flushStream (int64 conversion drops sub-second parts).
-	closedCount := 0
-	for _, sess := range s.Sessions {
-		if sess.End != nil {
-			closedCount++
-		}
-	}
-	tolerance := time.Duration(closedCount) * time.Second
-	if wallClock > 0 && streamTotal+tolerance < wallClock {
-		return fmt.Errorf(
-			"inconsistent data in %s: total stream time (%s) is less than wall-clock time (%s)",
-			s.FilePath, streamTotal, wallClock,
-		)
-	}
-	return nil
 }
 
 // Save writes the store to disk using an atomic write-to-temp-then-rename
@@ -172,33 +131,44 @@ func (s *Store) DeleteStream(id string) {
 	}
 }
 
-// ToggleStream activates or deactivates a single stream by ID.
-// Session management is edge-triggered: we only open/close a wall-clock
-// session when the count of active streams crosses zero. This means
-// switching between streams (deactivate A, activate B) doesn't create a
-// gap in the wall-clock session — only going from "nothing active" to
-// "something active" (or vice versa) triggers a session boundary.
+// ToggleStream activates or deactivates a single stream by ID, using the
+// current time. See toggleStreamAt for the full documentation.
 func (s *Store) ToggleStream(id string) {
+	s.toggleStreamAt(id, time.Now())
+}
+
+// ToggleStreamAt activates or deactivates a single stream by ID, using the
+// provided startAt time instead of time.Now(). This lets the user backdate
+// a stream activation (e.g. "I actually started 5 minutes ago"). When
+// deactivating, startAt is ignored — we always use now.
+func (s *Store) ToggleStreamAt(id string, startAt time.Time) {
+	s.toggleStreamAt(id, startAt)
+}
+
+// toggleStreamAt is the shared implementation for ToggleStream and
+// ToggleStreamAt. Session management is edge-triggered: we only open/close
+// a wall-clock session when the count of active streams crosses zero. This
+// means switching between streams (deactivate A, activate B) doesn't create
+// a gap in the wall-clock session — only going from "nothing active" to
+// "something active" (or vice versa) triggers a session boundary.
+func (s *Store) toggleStreamAt(id string, startAt time.Time) {
 	hadActive := s.HasActive()
 	for i := range s.Streams {
 		if s.Streams[i].ID == id {
 			if s.Streams[i].Active {
-				// Deactivating: flush elapsed time to Seconds and clear
-				// StartedAt so we stop accumulating live time.
-				s.flushStream(&s.Streams[i])
 				s.Streams[i].Active = false
 				s.Streams[i].StartedAt = nil
 			} else {
-				now := time.Now()
+				t := startAt
 				s.Streams[i].Active = true
-				s.Streams[i].StartedAt = &now
+				s.Streams[i].StartedAt = &t
 			}
 			break
 		}
 	}
 	hasActive := s.HasActive()
 	if !hadActive && hasActive {
-		s.Sessions = append(s.Sessions, Session{Start: time.Now()})
+		s.Sessions = append(s.Sessions, Session{Start: startAt})
 	} else if hadActive && !hasActive {
 		s.closeCurrentSession()
 	}
@@ -214,7 +184,6 @@ func (s *Store) StopAll() {
 	for i := range s.Streams {
 		if s.Streams[i].Active {
 			s.LastActive = append(s.LastActive, s.Streams[i].ID)
-			s.flushStream(&s.Streams[i])
 			s.Streams[i].Active = false
 			s.Streams[i].StartedAt = nil
 		}
@@ -277,35 +246,42 @@ func (s *Store) TotalWallClock() time.Duration {
 	return total.Truncate(time.Second)
 }
 
-// flushStream converts the live elapsed time (since StartedAt) into the
-// persisted Seconds field. The int64 conversion truncates sub-second
-// precision, which is acceptable when stopping a stream. For periodic
-// background saves, use SaveForBackground instead — it preserves the
-// fractional remainder by adjusting StartedAt rather than resetting it.
-func (s *Store) flushStream(st *Stream) {
-	if st.StartedAt != nil {
-		st.Seconds += int64(time.Since(*st.StartedAt).Seconds())
-	}
+// AddPastTime creates a closed session for a completed time block without
+// activating any stream. This is for recording work that happened entirely
+// in the past (e.g. a meeting from 10:00–10:45 that the user forgot to track).
+func (s *Store) AddPastTime(start, end time.Time) {
+	s.Sessions = append(s.Sessions, Session{Start: start, End: &end})
 }
 
-// SaveForBackground persists stream progress while the app is running (called
-// on quit). Unlike a full stop, streams stay Active so they resume on next
-// launch. The key difference from flushStream is how StartedAt is handled:
-// rather than resetting to time.Now() (which would discard the sub-second
-// remainder on every save), we advance StartedAt by only the whole-second
-// portion of the elapsed time. This prevents cumulative rounding drift that
-// would cause stream seconds to fall behind wall-clock time.
-func (s *Store) SaveForBackground() error {
-	for i := range s.Streams {
-		if s.Streams[i].Active && s.Streams[i].StartedAt != nil {
-			elapsed := time.Since(*s.Streams[i].StartedAt)
-			whole := elapsed.Truncate(time.Second)
-			s.Streams[i].Seconds += int64(whole / time.Second)
-			adjusted := s.Streams[i].StartedAt.Add(whole)
-			s.Streams[i].StartedAt = &adjusted
-		}
+// DeleteSession removes the session at the given index by splice-removing it
+// from the Sessions slice. This is index-based (not ID-based like DeleteStream)
+// because sessions don't have unique identifiers — they're identified by
+// position in the sorted list shown to the user.
+func (s *Store) DeleteSession(index int) {
+	if index < 0 || index >= len(s.Sessions) {
+		return
 	}
-	return s.Save()
+	s.Sessions = append(s.Sessions[:index], s.Sessions[index+1:]...)
+}
+
+// UpdateSession replaces the start and end times of the session at the given
+// index.
+func (s *Store) UpdateSession(index int, start time.Time, end *time.Time) error {
+	if index < 0 || index >= len(s.Sessions) {
+		return fmt.Errorf("session index out of range")
+	}
+	s.Sessions[index].Start = start
+	s.Sessions[index].End = end
+	return nil
+}
+
+// SortSessionsDesc sorts sessions by start time descending (newest first).
+// This is the display order for the session list view — the most recent
+// session is at the top, matching how users think about their recent work.
+func (s *Store) SortSessionsDesc() {
+	sort.SliceStable(s.Sessions, func(i, j int) bool {
+		return s.Sessions[i].Start.After(s.Sessions[j].Start)
+	})
 }
 
 func (s *Store) HasActive() bool {
@@ -317,8 +293,8 @@ func (s *Store) HasActive() bool {
 	return false
 }
 
-// SortStreams sorts active streams to the top, then by elapsed time descending.
-// SliceStable (not Slice) is used so streams with equal elapsed time preserve
+// SortStreams sorts active streams to the top, then by creation time
+// (oldest first). SliceStable is used so streams with equal state preserve
 // their relative order, avoiding visual jitter in the TUI.
 func (s *Store) SortStreams() {
 	sort.SliceStable(s.Streams, func(i, j int) bool {
@@ -326,18 +302,6 @@ func (s *Store) SortStreams() {
 		if ai != aj {
 			return ai
 		}
-		return s.Streams[i].Elapsed() > s.Streams[j].Elapsed()
+		return s.Streams[i].CreatedAt.Before(s.Streams[j].CreatedAt)
 	})
-}
-
-// Elapsed returns the total duration (stored + live) for a stream.
-// The live portion is truncated to whole seconds so the displayed counter
-// increments cleanly in 1-second steps rather than flickering with sub-second
-// updates.
-func (st *Stream) Elapsed() time.Duration {
-	d := time.Duration(st.Seconds) * time.Second
-	if st.Active && st.StartedAt != nil {
-		d += time.Since(*st.StartedAt).Truncate(time.Second)
-	}
-	return d
 }

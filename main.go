@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,17 +35,35 @@ func tickCmd() tea.Cmd {
 // while everything else is value-type view state. pendingD implements
 // vim-style "dd" delete: the first "d" sets pendingD, the second triggers
 // the delete. Any other key resets it.
+// startingAt tracks the "timed toggle" input mode, where the user types a
+// backdated start time (minutes ago or HH:MM) before activating a stream.
+// startingAtID remembers which stream to activate once the input is confirmed.
+// startErr holds a parse error to display inline until the next keypress.
+// viewSessions toggles between the stream list (default) and the session list.
+// sessionCursor tracks the cursor position independently within the session
+// list so switching views preserves each cursor's position.
 type model struct {
-	store      *Store
-	cursor     int
-	adding     bool
-	addAbove   bool
-	pendingD   bool
-	confirmDel bool
-	textinput  textinput.Model
-	ticking    bool
-	width      int
-	height     int
+	store        *Store
+	cursor       int
+	adding       bool
+	addAbove     bool
+	pendingD     bool
+	confirmDel   bool
+	startingAt       bool
+	startingAtID     string
+	startErr         string
+	loggingPast      bool
+	loggingPastStart *time.Time
+	viewSessions        bool
+	sessionCursor       int
+	pendingSessionD     bool
+	confirmSessionDel   bool
+	editingSession      bool
+	editingSessionStart *time.Time
+	textinput    textinput.Model
+	ticking      bool
+	width        int
+	height       int
 }
 
 func initialModel(store *Store) model {
@@ -83,11 +102,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.viewSessions {
+			if m.confirmSessionDel {
+				return m.updateConfirmSessionDel(msg)
+			}
+			if m.editingSession {
+				return m.updateEditingSession(msg)
+			}
+			return m.updateSessionView(msg)
+		}
 		if m.confirmDel {
 			return m.updateConfirmDel(msg)
 		}
 		if m.adding {
 			return m.updateAdding(msg)
+		}
+		if m.startingAt {
+			return m.updateStartingAt(msg)
+		}
+		if m.loggingPast {
+			return m.updateLoggingPast(msg)
 		}
 		return m.updateNormal(msg)
 	}
@@ -150,6 +184,303 @@ func (m model) updateAdding(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) updateStartingAt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		input := strings.TrimSpace(m.textinput.Value())
+		if input == "" {
+			m.startingAt = false
+			m.textinput.Reset()
+			return m, nil
+		}
+		startAt, err := parseStartTime(input)
+		if err != nil {
+			m.startErr = err.Error()
+			return m, nil
+		}
+		m.store.ToggleStreamAt(m.startingAtID, startAt)
+		m.sortAndFollow()
+		m.store.Save()
+		if !m.ticking && m.store.HasActive() {
+			m.ticking = true
+			m.startingAt = false
+			m.textinput.Reset()
+			return m, tickCmd()
+		}
+		m.startingAt = false
+		m.textinput.Reset()
+		return m, nil
+	case "esc":
+		m.startingAt = false
+		m.startErr = ""
+		m.textinput.Reset()
+		return m, nil
+	}
+	m.startErr = ""
+	var cmd tea.Cmd
+	m.textinput, cmd = m.textinput.Update(msg)
+	return m, cmd
+}
+
+// parseStartTime interprets the user's input as either minutes ago (plain
+// number) or an absolute HH:MM time (contains ':'). Returns the resolved
+// time.Time or an error for invalid input.
+func parseStartTime(input string) (time.Time, error) {
+	if strings.Contains(input, ":") {
+		t, err := time.Parse("15:04", input)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("invalid time format, use HH:MM")
+		}
+		now := time.Now()
+		startAt := time.Date(now.Year(), now.Month(), now.Day(),
+			t.Hour(), t.Minute(), 0, 0, now.Location())
+		if startAt.After(now) {
+			return time.Time{}, fmt.Errorf("time is in the future")
+		}
+		return startAt, nil
+	}
+	mins, err := strconv.Atoi(input)
+	if err != nil || mins < 0 {
+		return time.Time{}, fmt.Errorf("enter a number of minutes or HH:MM")
+	}
+	return time.Now().Add(-time.Duration(mins) * time.Minute), nil
+}
+
+// updateLoggingPast handles two-phase input for logging a completed past time
+// block. Phase 1 collects the start time; phase 2 collects the end time and
+// validates that end > start before committing the block via AddPastTime.
+func (m model) updateLoggingPast(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		input := strings.TrimSpace(m.textinput.Value())
+		if input == "" {
+			m.loggingPast = false
+			m.loggingPastStart = nil
+			m.textinput.Reset()
+			return m, nil
+		}
+		parsed, err := parseStartTime(input)
+		if err != nil {
+			m.startErr = err.Error()
+			return m, nil
+		}
+		if m.loggingPastStart == nil {
+			// Phase 1: start time collected, now ask for end time.
+			m.loggingPastStart = &parsed
+			m.startErr = ""
+			m.textinput.Reset()
+			m.textinput.Placeholder = "End time (minutes ago or HH:MM)"
+			return m, nil
+		}
+		// Phase 2: end time collected, validate and commit.
+		end := parsed
+		start := *m.loggingPastStart
+		if !end.After(start) {
+			m.startErr = "end time must be after start time"
+			return m, nil
+		}
+		m.store.AddPastTime(start, end)
+		m.sortAndFollow()
+		m.store.Save()
+		m.loggingPast = false
+		m.loggingPastStart = nil
+		m.startErr = ""
+		m.textinput.Reset()
+		return m, nil
+	case "esc":
+		m.loggingPast = false
+		m.loggingPastStart = nil
+		m.startErr = ""
+		m.textinput.Reset()
+		return m, nil
+	}
+	m.startErr = ""
+	var cmd tea.Cmd
+	m.textinput, cmd = m.textinput.Update(msg)
+	return m, cmd
+}
+
+// updateSessionView handles navigation and actions within the session list.
+// j/k move the cursor, dd initiates deletion (with confirmation), enter starts
+// editing a session's times, and v/esc return to the stream view.
+func (m model) updateSessionView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() != "d" {
+		m.pendingSessionD = false
+	}
+	switch msg.String() {
+	case "q", "ctrl+c":
+		m.store.Save()
+		return m, tea.Quit
+
+	case "j", "down":
+		if len(m.store.Sessions) > 0 {
+			m.sessionCursor = (m.sessionCursor + 1) % len(m.store.Sessions)
+		}
+		return m, nil
+
+	case "k", "up":
+		if len(m.store.Sessions) > 0 {
+			m.sessionCursor = (m.sessionCursor - 1 + len(m.store.Sessions)) % len(m.store.Sessions)
+		}
+		return m, nil
+
+	case "d":
+		if len(m.store.Sessions) == 0 {
+			return m, nil
+		}
+		if !m.pendingSessionD {
+			m.pendingSessionD = true
+			return m, nil
+		}
+		// dd: always confirm since sessions have time data.
+		m.pendingSessionD = false
+		m.confirmSessionDel = true
+		return m, nil
+
+	case "enter":
+		if len(m.store.Sessions) == 0 {
+			return m, nil
+		}
+		sess := m.store.Sessions[m.sessionCursor]
+		m.editingSession = true
+		m.editingSessionStart = nil
+		m.startErr = ""
+		m.textinput.Reset()
+		// Show current start time as placeholder for context.
+		m.textinput.Placeholder = fmt.Sprintf("Start HH:MM (current: %s)", sess.Start.Format("15:04"))
+		m.textinput.Focus()
+		return m, textinput.Blink
+
+	case "v", "esc":
+		m.viewSessions = false
+		return m, nil
+	}
+	return m, nil
+}
+
+// updateConfirmSessionDel handles the y/n confirmation prompt when deleting a
+// session. Deletion is always safe for validate() because removing a session
+// reduces wall-clock time, which can only make the invariant easier to satisfy.
+func (m model) updateConfirmSessionDel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y":
+		m.confirmSessionDel = false
+		m.store.DeleteSession(m.sessionCursor)
+		m.store.SortSessionsDesc()
+		m.store.Save()
+		if m.sessionCursor >= len(m.store.Sessions) && m.sessionCursor > 0 {
+			m.sessionCursor--
+		}
+		return m, nil
+	default:
+		m.confirmSessionDel = false
+		return m, nil
+	}
+}
+
+// updateEditingSession handles two-phase time editing for a session.
+// Phase 1 collects the new start time; phase 2 collects the new end time.
+// Times are entered as HH:MM and anchored to the session's original date so
+// the user doesn't need to re-enter the date. For ongoing sessions (End==nil),
+// only the start time is edited — the session remains open.
+// After applying the edit, validate() is run; on failure the edit is reverted
+// and an error is shown.
+func (m model) updateEditingSession(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		input := strings.TrimSpace(m.textinput.Value())
+		sess := m.store.Sessions[m.sessionCursor]
+
+		if m.editingSessionStart == nil {
+			// Phase 1: collecting start time.
+			if input == "" {
+				// Empty input keeps the original start time.
+				m.editingSessionStart = &sess.Start
+			} else {
+				t, err := time.Parse("15:04", input)
+				if err != nil {
+					m.startErr = "invalid time format, use HH:MM"
+					return m, nil
+				}
+				// Anchor to the session's original date.
+				newStart := time.Date(sess.Start.Year(), sess.Start.Month(), sess.Start.Day(),
+					t.Hour(), t.Minute(), 0, 0, sess.Start.Location())
+				m.editingSessionStart = &newStart
+			}
+
+			// For ongoing sessions, skip end time phase — apply immediately.
+			if sess.End == nil {
+				newStart := *m.editingSessionStart
+				if err := m.store.UpdateSession(m.sessionCursor, newStart, nil); err != nil {
+					m.startErr = "invalid: " + err.Error()
+					m.editingSessionStart = nil
+					return m, nil
+				}
+				m.store.SortSessionsDesc()
+				m.store.Save()
+				m.editingSession = false
+				m.editingSessionStart = nil
+				m.startErr = ""
+				m.textinput.Reset()
+				return m, nil
+			}
+
+			// Move to phase 2: end time.
+			m.startErr = ""
+			m.textinput.Reset()
+			m.textinput.Placeholder = fmt.Sprintf("End HH:MM (current: %s)", sess.End.Format("15:04"))
+			return m, nil
+		}
+
+		// Phase 2: collecting end time.
+		newStart := *m.editingSessionStart
+		var newEnd *time.Time
+		if input == "" {
+			// Empty input keeps the original end time.
+			newEnd = sess.End
+		} else {
+			t, err := time.Parse("15:04", input)
+			if err != nil {
+				m.startErr = "invalid time format, use HH:MM"
+				return m, nil
+			}
+			// Anchor end to the original end date (may differ from start date
+			// for sessions that cross midnight).
+			endTime := time.Date(sess.End.Year(), sess.End.Month(), sess.End.Day(),
+				t.Hour(), t.Minute(), 0, 0, sess.End.Location())
+			newEnd = &endTime
+		}
+
+		if newEnd != nil && !newEnd.After(newStart) {
+			m.startErr = "end time must be after start time"
+			return m, nil
+		}
+
+		if err := m.store.UpdateSession(m.sessionCursor, newStart, newEnd); err != nil {
+			m.startErr = "invalid: " + err.Error()
+			return m, nil
+		}
+		m.store.SortSessionsDesc()
+		m.store.Save()
+		m.editingSession = false
+		m.editingSessionStart = nil
+		m.startErr = ""
+		m.textinput.Reset()
+		return m, nil
+
+	case "esc":
+		m.editingSession = false
+		m.editingSessionStart = nil
+		m.startErr = ""
+		m.textinput.Reset()
+		return m, nil
+	}
+	m.startErr = ""
+	var cmd tea.Cmd
+	m.textinput, cmd = m.textinput.Update(msg)
+	return m, cmd
+}
+
 func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() != "d" {
 		m.pendingD = false
@@ -157,9 +488,8 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
 		// Save with streams still active so they resume on next launch.
-		// We use SaveForBackground (not StopAll + Save) to preserve the
-		// active state — quitting is not the same as stopping work.
-		m.store.SaveForBackground()
+		// Quitting is not the same as stopping work.
+		m.store.Save()
 		return m, tea.Quit
 
 	case "j", "down", "ctrl+j":
@@ -231,12 +561,47 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.store.Streams) == 0 {
 			return m, nil
 		}
-		// If stream has recorded time, ask for confirmation
-		if m.store.Streams[m.cursor].Elapsed() > 0 {
-			m.confirmDel = true
+		m.confirmDel = true
+		return m, nil
+
+	case "t":
+		if len(m.store.Streams) == 0 {
 			return m, nil
 		}
-		return m.performDelete()
+		stream := m.store.Streams[m.cursor]
+		if stream.Active {
+			// If already active, just deactivate — backdating doesn't apply.
+			m.store.ToggleStream(stream.ID)
+			m.sortAndFollow()
+			m.store.Save()
+			if !m.store.HasActive() {
+				m.ticking = false
+			}
+			return m, nil
+		}
+		// Enter timed-start input mode.
+		m.startingAt = true
+		m.startingAtID = stream.ID
+		m.startErr = ""
+		m.textinput.Placeholder = "Minutes ago or HH:MM"
+		m.textinput.Focus()
+		return m, textinput.Blink
+
+	case "T":
+		// Enter "log past time" input mode: two sequential prompts for
+		// start and end time. A closed session is added directly.
+		m.loggingPast = true
+		m.loggingPastStart = nil
+		m.startErr = ""
+		m.textinput.Placeholder = "Start time (minutes ago or HH:MM)"
+		m.textinput.Focus()
+		return m, textinput.Blink
+
+	case "v":
+		m.viewSessions = true
+		m.store.SortSessionsDesc()
+		m.sessionCursor = 0
+		return m, nil
 
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		n := int(msg.String()[0] - '1')
@@ -298,19 +663,24 @@ func formatDuration(total time.Duration) string {
 }
 
 func (m model) View() string {
+	if m.viewSessions {
+		return m.viewSessionList()
+	}
+
 	var b strings.Builder
 
 	b.WriteString(titleStyle.Render("urd - Time Tracker"))
 	b.WriteString("\n\n")
 
-	// Left column: stream list
-	var left strings.Builder
 	if len(m.store.Streams) == 0 && !m.adding {
-		left.WriteString("  No streams. Press 'o' to add one.\n")
+		// Box-drawn empty state gives visual weight to the onboarding hint,
+		// making the first-launch experience feel intentional rather than broken.
+		boxStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("8")).
+			Padding(1, 2)
+		b.WriteString(boxStyle.Render("No streams yet.\nPress 'o' to start.") + "\n")
 	}
-
-	total := m.store.TotalWallClock()
-	totalSec := total.Seconds()
 
 	for i, s := range m.store.Streams {
 		cursor := "  "
@@ -320,13 +690,7 @@ func (m model) View() string {
 
 		num := lipgloss.NewStyle().Faint(true).Render(fmt.Sprintf("%d ", i+1))
 
-		pctStr := ""
-		if totalSec > 0 {
-			pct := s.Elapsed().Seconds() / totalSec * 100
-			pctStr = fmt.Sprintf("  %5.1f%%", pct)
-		}
-
-		line := fmt.Sprintf("%-20s %s%s", s.Name, formatDuration(s.Elapsed()), pctStr)
+		line := fmt.Sprintf("%-20s", s.Name)
 		if s.Active {
 			line += "  " + dotStyle.Render("●")
 		}
@@ -337,25 +701,110 @@ func (m model) View() string {
 		b.WriteString("\n  " + m.textinput.View() + "\n")
 	}
 
+	if m.startingAt {
+		b.WriteString("\n  Start time: " + m.textinput.View() + "\n")
+		if m.startErr != "" {
+			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+			b.WriteString("  " + errStyle.Render(m.startErr) + "\n")
+		}
+	}
+
+	if m.loggingPast {
+		label := "Start time: "
+		if m.loggingPastStart != nil {
+			label = "End time: "
+		}
+		b.WriteString("\n  " + label + m.textinput.View() + "\n")
+		if m.startErr != "" {
+			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+			b.WriteString("  " + errStyle.Render(m.startErr) + "\n")
+		}
+	}
+
 	if m.confirmDel {
 		warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
 		name := m.store.Streams[m.cursor].Name
-		b.WriteString("\n  " + warnStyle.Render(fmt.Sprintf("Delete \"%s\"? It has recorded time. (y/n)", name)) + "\n")
+		b.WriteString("\n  " + warnStyle.Render(fmt.Sprintf("Delete \"%s\"? (y/n)", name)) + "\n")
 	}
 
 	b.WriteString("\n")
 
+	total := m.store.TotalWallClock()
 	if total > 0 || m.store.HasActive() {
-		var sumStreams time.Duration
-		for _, s := range m.store.Streams {
-			sumStreams += s.Elapsed()
-		}
 		dimStyle := lipgloss.NewStyle().Faint(true)
-		b.WriteString(fmt.Sprintf("  %s\n", dimStyle.Render(fmt.Sprintf("Wall clock: %s", formatDuration(total)))))
-		b.WriteString(fmt.Sprintf("  %s\n", dimStyle.Render(fmt.Sprintf("Total:      %s", formatDuration(sumStreams)))))
+		fmt.Fprintf(&b, "  %s\n", dimStyle.Render(fmt.Sprintf("Wall clock: %s", formatDuration(total))))
 	}
 
-	b.WriteString(helpStyle.Render("\n  o/O add below/above · enter toggle · dd delete · s stop all · c continue · q quit"))
+	b.WriteString(helpStyle.Render("\n  o/O add below/above · enter toggle · t timed start · T log past · dd delete · s stop all · c continue · v sessions · q quit"))
+
+	return b.String()
+}
+
+// viewSessionList renders the session list view. Each row shows the date,
+// start/end time (or "..." for ongoing), duration, and an active indicator.
+// The cursor highlights the selected row for editing or deletion.
+func (m model) viewSessionList() string {
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render("urd - Sessions"))
+	b.WriteString("\n\n")
+
+	if len(m.store.Sessions) == 0 {
+		dimStyle := lipgloss.NewStyle().Faint(true)
+		b.WriteString("  " + dimStyle.Render("No sessions recorded yet.") + "\n")
+	}
+
+	for i, sess := range m.store.Sessions {
+		cursor := "  "
+		if i == m.sessionCursor {
+			cursor = cursorStyle.Render("> ")
+		}
+
+		date := sess.Start.Format("2006-01-02")
+		startTime := sess.Start.Format("15:04")
+		endTime := "..."
+		if sess.End != nil {
+			endTime = sess.End.Format("15:04")
+		}
+
+		var dur time.Duration
+		if sess.End != nil {
+			dur = sess.End.Sub(sess.Start)
+		} else {
+			dur = time.Since(sess.Start).Truncate(time.Second)
+		}
+
+		line := fmt.Sprintf("%s  %s - %-5s   (%s)", date, startTime, endTime, formatDuration(dur))
+		if sess.End == nil {
+			line += "  " + dotStyle.Render("●")
+		}
+
+		b.WriteString(cursor + line + "\n")
+	}
+
+	if m.editingSession {
+		label := "Start time: "
+		if m.editingSessionStart != nil {
+			label = "End time: "
+		}
+		b.WriteString("\n  " + label + m.textinput.View() + "\n")
+		if m.startErr != "" {
+			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+			b.WriteString("  " + errStyle.Render(m.startErr) + "\n")
+		}
+	}
+
+	if m.confirmSessionDel {
+		warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
+		sess := m.store.Sessions[m.sessionCursor]
+		b.WriteString("\n  " + warnStyle.Render(fmt.Sprintf(
+			"Delete session %s %s? (y/n)",
+			sess.Start.Format("2006-01-02"),
+			sess.Start.Format("15:04"),
+		)) + "\n")
+	}
+
+	b.WriteString(helpStyle.Render("\n  j/k navigate · dd delete · enter edit · v back · q quit"))
 
 	return b.String()
 }

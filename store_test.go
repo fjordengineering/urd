@@ -254,45 +254,28 @@ func TestHasActive(t *testing.T) {
 	}
 }
 
-func TestElapsed(t *testing.T) {
-	st := Stream{Seconds: 60}
-	d := st.Elapsed()
-	if d != time.Minute {
-		t.Fatalf("expected 1m, got %s", d)
-	}
-
-	now := time.Now().Add(-10 * time.Second)
-	st.Active = true
-	st.StartedAt = &now
-	d = st.Elapsed()
-	if d < time.Minute+9*time.Second || d > time.Minute+11*time.Second {
-		t.Fatalf("expected ~1m10s, got %s", d)
-	}
-}
-
 func TestSortStreams(t *testing.T) {
 	s := newTestStore(t)
-	s.AddStream("Small", 0)
-	s.AddStream("Big", 1)
-	s.AddStream("Active", 2)
+	s.AddStream("First", 0)
+	s.AddStream("Second", 1)
+	s.AddStream("Third", 2)
 
-	s.Streams[0].Seconds = 10
-	s.Streams[1].Seconds = 100
-	s.Streams[2].Seconds = 5
 	now := time.Now()
 	s.Streams[2].Active = true
 	s.Streams[2].StartedAt = &now
 
 	s.SortStreams()
 
-	if s.Streams[0].Name != "Active" {
+	// Active stream should be first.
+	if s.Streams[0].Name != "Third" {
 		t.Fatalf("expected active stream first, got %q", s.Streams[0].Name)
 	}
-	if s.Streams[1].Name != "Big" {
-		t.Fatalf("expected 'Big' second, got %q", s.Streams[1].Name)
+	// Inactive streams preserve creation order.
+	if s.Streams[1].Name != "First" {
+		t.Fatalf("expected 'First' second, got %q", s.Streams[1].Name)
 	}
-	if s.Streams[2].Name != "Small" {
-		t.Fatalf("expected 'Small' third, got %q", s.Streams[2].Name)
+	if s.Streams[2].Name != "Second" {
+		t.Fatalf("expected 'Second' third, got %q", s.Streams[2].Name)
 	}
 }
 
@@ -306,36 +289,6 @@ func TestTotalWallClock(t *testing.T) {
 	wc := s.TotalWallClock()
 	if wc != time.Hour {
 		t.Fatalf("expected 1h, got %s", wc)
-	}
-}
-
-func TestValidateInconsistentData(t *testing.T) {
-	s := newTestStore(t)
-	now := time.Now()
-	end := now.Add(2 * time.Hour)
-	s.Sessions = []Session{{Start: now, End: &end}}
-	s.Streams = []Stream{{Seconds: 60}} // 1 min < 2h wall clock
-	if err := s.Save(); err != nil {
-		t.Fatal(err)
-	}
-	_, err := LoadStore(s.FilePath)
-	if err == nil {
-		t.Fatal("expected validation error")
-	}
-}
-
-func TestValidateConsistentData(t *testing.T) {
-	s := newTestStore(t)
-	now := time.Now()
-	end := now.Add(time.Hour)
-	s.Sessions = []Session{{Start: now, End: &end}}
-	s.Streams = []Stream{{Seconds: 7200}} // 2h > 1h
-	if err := s.Save(); err != nil {
-		t.Fatal(err)
-	}
-	_, err := LoadStore(s.FilePath)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
 	}
 }
 
@@ -371,5 +324,79 @@ func TestFormatDuration(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("formatDuration(%s) = %q, want %q", tt.d, got, tt.want)
 		}
+	}
+}
+
+func TestDeleteSession(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	end1 := now.Add(time.Hour)
+	end2 := now.Add(2 * time.Hour)
+	s.Sessions = []Session{
+		{Start: now, End: &end1},
+		{Start: now.Add(time.Hour), End: &end2},
+	}
+	s.DeleteSession(0)
+	if len(s.Sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(s.Sessions))
+	}
+	if s.Sessions[0].Start != now.Add(time.Hour) {
+		t.Fatal("expected second session to remain")
+	}
+}
+
+func TestDeleteSessionOutOfBounds(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	end := now.Add(time.Hour)
+	s.Sessions = []Session{{Start: now, End: &end}}
+	s.DeleteSession(5)  // out of bounds
+	s.DeleteSession(-1) // negative
+	if len(s.Sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(s.Sessions))
+	}
+}
+
+func TestUpdateSession(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	end := now.Add(2 * time.Hour)
+	s.Sessions = []Session{{Start: now, End: &end}}
+
+	newEnd := now.Add(time.Hour)
+	err := s.UpdateSession(0, now, &newEnd)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if s.Sessions[0].End.Sub(s.Sessions[0].Start) != time.Hour {
+		t.Fatal("expected session to be 1 hour")
+	}
+}
+
+func TestSortSessionsDesc(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	e1 := now.Add(time.Hour)
+	e2 := now.Add(3 * time.Hour)
+	s.Sessions = []Session{
+		{Start: now, End: &e1},
+		{Start: now.Add(2 * time.Hour), End: &e2},
+	}
+	s.SortSessionsDesc()
+	if !s.Sessions[0].Start.After(s.Sessions[1].Start) {
+		t.Fatal("expected newest session first")
+	}
+}
+
+func TestAddPastTime(t *testing.T) {
+	s := newTestStore(t)
+	start := time.Now().Add(-time.Hour)
+	end := time.Now()
+	s.AddPastTime(start, end)
+	if len(s.Sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(s.Sessions))
+	}
+	if s.Sessions[0].End == nil {
+		t.Fatal("expected closed session")
 	}
 }
